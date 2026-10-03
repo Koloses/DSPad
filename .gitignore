@@ -1,0 +1,7 @@
+*.dll
+*.exe
+*.o
+*.zip
+*.log
+__pycache__/
+tools/exports.txt
