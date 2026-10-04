@@ -102,7 +102,7 @@ To uninstall, run `DSPad\uninstall.bat`, or delete the mod's `Mss32.dll` and ren
 | `TargetInfoBar` | 1 | Bottom readout follows the pad target |
 | `HideCursorWithPad` | 1 | Hide the mouse pointer during pad play |
 | `MoveMode` | 2 | 2 direct control, 1 steer through the movement planner, 0 plain move orders |
-| `StickXSign` | 0 | Set to 1 or -1 if left and right are mirrored |
+| `StickXSign` | 0 | Set to 1 if left and right are mirrored |
 | `Log` | 1 | Write `dspad.log` in the game folder; 0 turns it off |
 
 ## Building
