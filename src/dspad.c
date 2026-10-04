@@ -1251,26 +1251,14 @@ static int cam_basis(const SiegePos *hp, float *fx, float *fz, float *rx, float 
     x /= len;
     z /= len;
 
-    int sign = c_stickXSign;
-    if (sign == 0) {
-        /* Work out the world's handedness from the camera's own right vector. */
-        Vec3 *cw = Cam_GetCameraPosition(cam), *tw = Cam_GetTargetPosition(cam);
-        float *m = Cam_GetMatrixOrientation(cam);
-        float wx = tw->x - cw->x, wy = tw->y - cw->y, wz = tw->z - cw->z;
-        float wl = sqrtf(wx * wx + wy * wy + wz * wz);
-        sign = 1;
-        if (wl > 0.01f) {
-            float rowErr = fabsf(m[0] * wx + m[1] * wy + m[2] * wz) / wl + fabsf(m[1]);
-            float colErr = fabsf(m[0] * wx + m[3] * wy + m[6] * wz) / wl + fabsf(m[3]);
-            float ax = rowErr <= colErr ? m[0] : m[0];
-            float az = rowErr <= colErr ? m[2] : m[6];
-            float h = wz * ax - wx * az;
-            sign = h >= 0 ? -1 : 1;
-            if (!g_handLogged) {
-                g_handLogged = 1;
-                logf_("camera basis: rowErr=%.3f colErr=%.3f h=%.3f -> StickXSign=%d", rowErr, colErr, h, sign);
-            }
-        }
+    /* Which side is "right" of the camera is a fixed property of the game's world. It used to be
+       re-derived every frame from the camera's matrix, and that reading flipped for single frames -
+       the hero then faced the mirror image of the stick's direction for that frame (a flicker while
+       walking). Now it is fixed; StickXSign=1 in the ini swaps it. */
+    int sign = c_stickXSign ? c_stickXSign : -1;
+    if (!g_handLogged) {
+        g_handLogged = 1;
+        logf_("camera basis: StickXSign=%d (set StickXSign=1 in the ini if left and right are swapped)", sign);
     }
     *fx = x;
     *fz = z;
@@ -3843,7 +3831,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         char exe[MAX_PATH];
         GetModuleFileNameA(NULL, exe, MAX_PATH);
         const char *b = strrchr(exe, '\\');
-        logf_("---- DSPad build 69 loaded into %s (pid %lu)", exe, GetCurrentProcessId());
+        logf_("---- DSPad build 70 loaded into %s (pid %lu)", exe, GetCurrentProcessId());
         char mark[8];
         if (GetEnvironmentVariableA("DSPAD_ACTIVE", mark, sizeof mark)) { logf_("another DSPad copy is already active in this process; this one stays idle"); return TRUE; }
         SetEnvironmentVariableA("DSPAD_ACTIVE", "1");
