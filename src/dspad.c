@@ -388,6 +388,10 @@ static float cfg_f(const char *key, float def)
     return (float)atof(buf);
 }
 static int c_autoPotion = 1;
+static int c_potionShare, c_potionKeep;
+static int c_pickGold = 1, c_pickPotions = 1;
+static int c_autoRes;
+static float c_pickRadius = 2.5f;
 static float c_autoPotionPct = 30.0f;
 static int cfg_i(const char *key, int def) { return (int)GetPrivateProfileIntA("DSPad", key, def, g_ini); }
 
@@ -445,6 +449,12 @@ static void load_config(void)
     c_followDist = cfg_f("FollowDistance", 3.5f);
     c_autoPotion = cfg_i("PartyAutoPotion", 1);
     c_autoPotionPct = cfg_f("PartyAutoPotionPercent", 30.0f);
+    c_potionShare = cfg_i("PotionShare", 1);
+    c_potionKeep = cfg_i("PotionShareKeep", 3);
+    c_autoRes = cfg_i("AutoResurrect", 1);
+    c_pickGold = cfg_i("AutoPickupGold", 1);
+    c_pickPotions = cfg_i("AutoPickupPotions", 1);
+    c_pickRadius = cfg_f("AutoPickupRadius", 2.5f);
     c_stickXSign = cfg_i("StickXSign", 0);
     c_cursorSpeed = cfg_f("CursorSpeed", 900.0f);
     c_navRepeatMs = cfg_i("NavRepeatMs", 170);
@@ -2976,9 +2986,334 @@ static void install_hover_hook(void)
 }
 
 /* companions (never the controlled hero) drink a potion of their own when health or mana runs low */
+#define AP_TESTGET_SYM "?TestGet@GoInventory@@QAE_NPBUGoid_@@_N@Z"
+#define AP_LIST_SYM "?ListItemsIncludeBackpacks@GoInventory@@QBE_NW4eInventoryLocation@@AAUGopColl@@@Z"
+#define AP_IL_MAIN 21
+#define AP_GOLD_DROPPER 0
+#define AP_ORIGIN AO_HUMAN
+#define AR_CAN_CAST ((Go_GetTemplateName || (Go_GetTemplateName = (void *)GetProcAddress(g_exe, "?GetTemplateName@Go@@QBEPBDXZ")) != NULL) && MakeJobReq_GG != NULL && GoMind_RSDoJob != NULL)
+#define AR_CAST(mind, target, spell) GoMind_RSDoJob(mind, MakeJobReq_GG(JAT_CAST, JQ_ACTION, QP_CLEAR, AO_HUMAN, target, spell))
+/* ------------------------------------------------------------------ automatic resurrection
+   When a party member is dead and someone alive in the party carries a resurrect scroll, that member
+   uses it on the fallen one - once no enemy is near the caster. Only companions do this; the hero the
+   player controls never casts on its own. */
+static void auto_resurrect(void *leader, DWORD now)
+{
+    static struct {
+        int ok;
+        void *(TC *getInv)(void *), *(TC *getMagic)(void *);
+        bool8 (TC *isSpell)(void *);
+        bool8 (TC *oneUse)(void *);
+        bool8 (TC *castable)(void *, void *, bool8);
+        bool8 (TC *listItems)(void *, int, GopColl *);
+        float (TC *curMana)(void *);
+    } f;
+    static struct { void *goid; DWORD t; } tried[8];
+    static DWORD last;
+    static int logs;
+    if (!c_autoRes || now - last < 1000) return;
+    last = now;
+    if (!f.ok) {
+        f.getInv = (void *)GetProcAddress(g_exe, "?GetInventory@Go@@QAEPAVGoInventory@@XZ");
+        f.getMagic = (void *)GetProcAddress(g_exe, "?GetMagic@Go@@QAEPAVGoMagic@@XZ");
+        f.isSpell = (void *)GetProcAddress(g_exe, "?IsSpell@Go@@QBE_NXZ");
+        f.oneUse = (void *)GetProcAddress(g_exe, "?GetIsOneUse@GoMagic@@QBE_NXZ");
+        f.castable = (void *)GetProcAddress(g_exe, "?IsCastableOn@GoMagic@@QAE_NPAVGo@@_N@Z");
+        f.listItems = (void *)GetProcAddress(g_exe, AP_LIST_SYM);
+        f.curMana = (void *)GetProcAddress(g_exe, "?GetCurrentMana@GoAspect@@QBEMXZ");
+        f.ok = f.getInv && f.getMagic && f.isSpell && f.oneUse && f.castable && f.listItems && f.curMana && AR_CAN_CAST ? 1 : -1;
+        logf_("auto resurrect: link %d", f.ok);
+    }
+    if (f.ok != 1) return;
+    void *party = get_party();
+    GopColl *kids = party ? Go_GetChildren(party) : NULL;
+    int n = rd(kids, 8) ? (int)(kids->e - kids->b) : 0;
+    void *members[16];
+    if (n <= 1 || n > 16 || !rd(kids->b, n * sizeof(void *))) return;
+    memcpy(members, kids->b, n * sizeof(void *));
+    int dead = 0;
+    for (int i = 0; i < n; i++) dead += rd(members[i], 0x100) && !go_alive(members[i]);
+    if (!dead) return;
+    /* who can cast: living companions with a scroll, the one with most mana first */
+    void *caster = NULL, *scroll = NULL;
+    float bestScore = -1e9f;
+    for (int i = 0; i < n; i++) {
+        void *c = members[i];
+        if (!rd(c, 0x100) || !go_alive(c)) continue;
+        if (c == leader) continue; /* the hero the player controls never casts on its own */
+        void *inv = f.getInv(c), *asp = Go_GetAspect ? Go_GetAspect(c) : NULL, *mind = Go_GetMind(c);
+        if (!rd(inv, 0x40) || !rd(asp, 0x40) || !rd(mind, 0x70)) continue;
+        g_coll.e = g_coll.b;
+        f.listItems(inv, AP_IL_MAIN, &g_coll);
+        int ni = (int)(g_coll.e - g_coll.b);
+        void *sc = NULL;
+        for (int k = 0; k < ni && ni <= 512 && rd(g_coll.b, ni * sizeof(void *)) && !sc; k++) {
+            void *it = g_coll.b[k];
+            if (!rd(it, 0x100) || !f.isSpell(it)) continue;
+            const char *tn = Go_GetTemplateName ? Go_GetTemplateName(it) : NULL;
+            void *mg = f.getMagic(it);
+            if (!tn || IsBadStringPtrA(tn, 64) || !strstr(tn, "resurrect") || !rd(mg, 0x40) || !f.oneUse(mg)) continue;
+            sc = it;
+        }
+        if (!sc) continue;
+        float score = f.curMana(asp);
+        if (score > bestScore) { bestScore = score; caster = c; scroll = sc; }
+    }
+    if (!caster) return;
+    void *mind = Go_GetMind(caster);
+    /* not in the middle of a fight */
+    g_coll.e = g_coll.b;
+    GoMind_GetEnemiesInSphere(mind, 10.0f, &g_coll);
+    int ne = (int)(g_coll.e - g_coll.b);
+    for (int k = 0; k < ne && ne < 4096 && rd(g_coll.b, ne * sizeof(void *)); k++)
+        if (go_alive(g_coll.b[k])) return;
+    void *mg = f.getMagic(scroll);
+    for (int i = 0; i < n; i++) {
+        void *t = members[i];
+        if (!rd(t, 0x100) || go_alive(t) || t == caster) continue;
+        if (!f.castable(mg, t, 0)) continue; /* unconscious only, or otherwise not something the scroll works on */
+        void *tg = Go_GetGoid(t);
+        int skip = 0, slot = 0;
+        for (int k = 0; k < 8; k++) {
+            if (tried[k].goid == tg && now - tried[k].t < 10000) skip = 1; /* a cast takes a while; no orders on top of each other */
+            if (tried[k].t < tried[slot].t) slot = k;
+        }
+        if (skip) continue;
+        tried[slot].goid = tg;
+        tried[slot].t = now;
+        if (logs < 20) {
+            const char *a = Go_GetTemplateName ? Go_GetTemplateName(caster) : NULL, *b = Go_GetTemplateName ? Go_GetTemplateName(t) : NULL;
+            logs++;
+            logf_("auto resurrect: %s uses a resurrect scroll on %s", a && !IsBadStringPtrA(a, 64) ? a : "?", b && !IsBadStringPtrA(b, 64) ? b : "?");
+        }
+        AR_CAST(mind, tg, Go_GetGoid(scroll));
+        return; /* one at a time */
+    }
+}
+
+/* ------------------------------------------------------------------ automatic pick-up
+   Gold and potions lying within reach of the controlled hero are taken without a button press, with
+   the routine the game's own "pick up" order ends in. The two kinds have separate switches. */
+static void auto_pickup(void *hero, const SiegePos *hp, DWORD now)
+{
+    static struct {
+        int ok;
+        void *(TC *getInv)(void *);
+        bool8 (TC *isGold)(void *), (TC *isPotion)(void *);
+        bool8 (TC *testGet)(void *, void *, bool8);
+        bool8 (TC *autoGet)(void *, void *, int);
+        bool8 (TC *listItems)(void *, int, GopColl *);
+        void *(TC *getGold)(void *);
+        void *(TC *droppedBy)(void *);
+    } f;
+    /* potions that have been in a party member's pack: one of those lying on the ground was put
+       there by the player, and is left alone */
+    static void *owned[768];
+    static int nOwned, ownedAt;
+    static struct { void *goid; DWORD t; } tried[24];
+    static DWORD last;
+    static int ti, logs;
+    if ((!c_pickGold && !c_pickPotions) || now - last < 200) return;
+    last = now;
+    if (!f.ok) {
+        f.getInv = (void *)GetProcAddress(g_exe, "?GetInventory@Go@@QAEPAVGoInventory@@XZ");
+        f.isGold = (void *)GetProcAddress(g_exe, "?IsGold@Go@@QBE_NXZ");
+        f.isPotion = (void *)GetProcAddress(g_exe, "?IsPotion@Go@@QBE_NXZ");
+        f.testGet = (void *)GetProcAddress(g_exe, AP_TESTGET_SYM);
+        f.autoGet = (void *)GetProcAddress(g_exe, "?SAutoGet@GoInventory@@QAE_NPBUGoid_@@W4eActionOrigin@@@Z");
+        f.listItems = (void *)GetProcAddress(g_exe, AP_LIST_SYM);
+        if (AP_GOLD_DROPPER) {
+            f.getGold = (void *)GetProcAddress(g_exe, "?GetGold@Go@@QAEPAVGoGold@@XZ");
+            f.droppedBy = (void *)GetProcAddress(g_exe, "?GetDroppedBy@GoGold@@QBEPBUGoid_@@XZ");
+        }
+        f.ok = f.getInv && f.isGold && f.isPotion && f.testGet && f.autoGet ? 1 : -1;
+        logf_("auto pick-up: link %d, gold %d, potions %d, radius %.1f m", f.ok, c_pickGold, c_pickPotions, c_pickRadius);
+    }
+    if (f.ok != 1) return;
+    void *aiq = AIQuery_Get();
+    void *inv = f.getInv(hero);
+    if (!rd(aiq, 0x10) || !rd(inv, 0x40)) return;
+    if (c_pickPotions && f.listItems) {
+        /* note every potion the party carries right now */
+        void *party = get_party();
+        GopColl *kids = party ? Go_GetChildren(party) : NULL;
+        int nm = rd(kids, 8) ? (int)(kids->e - kids->b) : 0;
+        void *members[16];
+        if (nm > 0 && nm <= 16 && rd(kids->b, nm * sizeof(void *))) {
+            memcpy(members, kids->b, nm * sizeof(void *));
+            for (int m = 0; m < nm; m++) {
+                void *minv = rd(members[m], 0x100) ? f.getInv(members[m]) : NULL;
+                if (!rd(minv, 0x40)) continue;
+                g_coll.e = g_coll.b;
+                f.listItems(minv, AP_IL_MAIN, &g_coll);
+                int ni = (int)(g_coll.e - g_coll.b);
+                if (ni <= 0 || ni > 512 || !rd(g_coll.b, ni * sizeof(void *))) continue;
+                for (int i = 0; i < ni; i++) {
+                    void *it = g_coll.b[i];
+                    if (!rd(it, 0x100) || !f.isPotion(it)) continue;
+                    void *gd = Go_GetGoid(it);
+                    int known = 0;
+                    for (int k = 0; k < nOwned && !known; k++) known = owned[k] == gd;
+                    if (known) continue;
+                    if (nOwned < 768) owned[nOwned++] = gd;
+                    else { owned[ownedAt] = gd; ownedAt = (ownedAt + 1) % 768; }
+                }
+            }
+        }
+    }
+    g_coll.e = g_coll.b;
+    AIQuery_GetOccupantsInSphere(aiq, hp, c_pickRadius, &g_coll);
+    int n = (int)(g_coll.e - g_coll.b);
+    if (n <= 0 || n > 8192 || !rd(g_coll.b, n * sizeof(void *))) return;
+    void *items[48];
+    int ni = 0;
+    for (int i = 0; i < n && ni < 48; i++) {
+        void *g = g_coll.b[i];
+        if (!rd(g, 0x100) || g == hero || Go_IsActor(g) || !Go_IsItem(g) || Go_IsInsideInventory(g)) continue;
+        int gold = f.isGold(g), potion = !gold && f.isPotion(g);
+        if (!(gold && c_pickGold) && !(potion && c_pickPotions)) continue;
+        if (!go_clickable(g)) continue;
+        if (potion) {
+            void *gd = Go_GetGoid(g);
+            int mine = 0;
+            for (int k = 0; k < nOwned && !mine; k++) mine = owned[k] == gd;
+            if (mine) continue; /* dropped by the player */
+        }
+        if (gold && f.getGold && f.droppedBy) {
+            /* gold remembers who dropped it: the party's own is left alone as well */
+            void *gg = f.getGold(g);
+            void *by = rd(gg, 0x20) ? f.droppedBy(gg) : NULL;
+            if (by) {
+                int own = 0;
+                void *party = get_party();
+                GopColl *kids = party ? Go_GetChildren(party) : NULL;
+                int nm = rd(kids, 8) ? (int)(kids->e - kids->b) : 0;
+                for (int m = 0; m < nm && nm <= 16 && rd(kids->b, nm * sizeof(void *)) && !own; m++)
+                    own = rd(kids->b[m], 0x100) && Go_GetGoid(kids->b[m]) == by;
+                if (own) continue;
+            }
+        }
+        items[ni++] = g; /* the calls below reuse the game's list buffer */
+    }
+    for (int i = 0; i < ni; i++) {
+        void *g = items[i], *goid = Go_GetGoid(g);
+        int skip = 0;
+        for (int k = 0; k < 24; k++)
+            if (tried[k].goid == goid && now - tried[k].t < 4000) skip = 1; /* could not be taken a moment ago (no room): not asked again at once */
+        if (skip) continue;
+        const char *tn = Go_GetTemplateName ? Go_GetTemplateName(g) : NULL;
+        char name[48];
+        lstrcpynA(name, tn && !IsBadStringPtrA(tn, 64) ? tn : "?", sizeof name); /* the object is gone once it is taken */
+        bool8 can = f.testGet(inv, goid, 1);
+        bool8 r = can ? f.autoGet(inv, goid, AP_ORIGIN) : 0;
+        tried[ti].goid = goid;
+        tried[ti].t = now;
+        ti = (ti + 1) % 24;
+        if (logs < 25) { logs++; logf_("auto pick-up: %s -> %s", name, !can ? "no room / not allowed" : r ? "taken" : "failed"); }
+    }
+}
+
+#define PS_LIST_SYM "?ListItemsIncludeBackpacks@GoInventory@@QBE_NW4eInventoryLocation@@AAUGopColl@@@Z"
+#define PS_ORIGIN AO_HUMAN
+static int potion_il_main(void) { return 21; } /* il_main */
+/* ------------------------------------------------------------------ potion sharing
+   A companion that needs a health or mana potion and has none is handed one by another member of
+   the party, using the game's own "give" routine. A member only gives while it has more than
+   PotionShareKeep potions of that kind, so nobody is emptied out. */
+/* PotionShare, PotionShareKeep: set in load_config (defaults 1 and 3) */
+static struct {
+    int ok;
+    void *(TC *getInv)(void *);
+    void *(TC *getMagic)(void *);
+    bool8 (TC *isPotion)(void *);
+    bool8 (TC *isHealth)(void *), (TC *isMana)(void *), (TC *isRejuv)(void *);
+    float (TC *fullRatio)(void *);
+    bool8 (TC *listItems)(void *, int, GopColl *);
+    bool8 (TC *autoGive)(void *, void *, void *, int);
+    int ilMain;
+} g_ps;
+static void potion_link(void)
+{
+    if (g_ps.ok) return;
+    g_ps.getInv = (void *)GetProcAddress(g_exe, "?GetInventory@Go@@QAEPAVGoInventory@@XZ");
+    g_ps.getMagic = (void *)GetProcAddress(g_exe, "?GetMagic@Go@@QAEPAVGoMagic@@XZ");
+    g_ps.isPotion = (void *)GetProcAddress(g_exe, "?IsPotion@Go@@QBE_NXZ");
+    g_ps.isHealth = (void *)GetProcAddress(g_exe, "?IsHealthPotion@GoMagic@@QBE_NXZ");
+    g_ps.isMana = (void *)GetProcAddress(g_exe, "?IsManaPotion@GoMagic@@QBE_NXZ");
+    g_ps.isRejuv = (void *)GetProcAddress(g_exe, "?IsRejuvenationPotion@GoMagic@@QBE_NXZ");
+    g_ps.fullRatio = (void *)GetProcAddress(g_exe, "?GetPotionFullRatio@GoMagic@@QBEMXZ");
+    g_ps.listItems = (void *)GetProcAddress(g_exe, PS_LIST_SYM);
+    g_ps.autoGive = (void *)GetProcAddress(g_exe, "?SAutoGive@GoInventory@@QAE_NPBUGoid_@@0W4eActionOrigin@@@Z");
+    g_ps.ilMain = potion_il_main();
+    g_ps.ok = g_ps.getInv && g_ps.getMagic && g_ps.isPotion && g_ps.isHealth && g_ps.isMana && g_ps.isRejuv && g_ps.fullRatio &&
+              g_ps.listItems && g_ps.autoGive && g_ps.ilMain >= 0 ? 1 : -1;
+    logf_("potion sharing: link %d (main inventory location %d), share %d, keep %d", g_ps.ok, g_ps.ilMain, c_potionShare, c_potionKeep);
+}
+/* how many potions of this kind (mana 0 = health, 1 = mana) the character carries; rejuvenation
+   potions count for both. *give is the one to hand over: a plain potion before a rejuvenation one */
+static int potion_count(void *go, int mana, void **give)
+{
+    void *inv = g_ps.getInv(go);
+    void *items[256];
+    int n, cnt = 0, haveOwn = 0;
+    if (give) *give = NULL;
+    if (!rd(inv, 0x40)) return 0;
+    g_coll.e = g_coll.b;
+    g_ps.listItems(inv, g_ps.ilMain, &g_coll);
+    n = (int)(g_coll.e - g_coll.b);
+    if (n <= 0 || n > 256 || !rd(g_coll.b, n * sizeof(void *))) return 0;
+    memcpy(items, g_coll.b, n * sizeof(void *));
+    for (int i = 0; i < n; i++) {
+        void *it = items[i];
+        if (!rd(it, 0x100) || !g_ps.isPotion(it)) continue;
+        void *mg = g_ps.getMagic(it);
+        if (!rd(mg, 0x40) || !(g_ps.fullRatio(mg) > 0.0f)) continue;
+        int own = mana ? g_ps.isMana(mg) : g_ps.isHealth(mg);
+        int rej = g_ps.isRejuv(mg);
+        if (!own && !rej) continue;
+        cnt++;
+        if (give && (!*give || (own && !rej && !haveOwn))) { *give = it; haveOwn = own && !rej; }
+    }
+    return cnt;
+}
+/* returns 1 when a potion was handed to `needy` */
+static int potion_share(void **members, int n, void *needy, int mana)
+{
+    void *best = NULL, *bestItem = NULL;
+    int bestCnt = 0;
+    for (int i = 0; i < n; i++) {
+        void *d = members[i], *item = NULL;
+        if (d == needy || !rd(d, 0x100)) continue;
+        int c = potion_count(d, mana, &item);
+        if (c > c_potionKeep && c > bestCnt && item) { bestCnt = c; best = d; bestItem = item; }
+    }
+    static int logs;
+    if (!best) {
+        static DWORD nl;
+        DWORD t = timeGetTime();
+        if (logs < 40 && t - nl > 5000) {
+            const char *tn = Go_GetTemplateName ? Go_GetTemplateName(needy) : NULL;
+            nl = t;
+            logs++;
+            logf_("potion sharing: %s needs a %s potion and has none; nobody in the party has more than %d to spare",
+                  tn && !IsBadStringPtrA(tn, 64) ? tn : "?", mana ? "mana" : "health", c_potionKeep);
+        }
+        return 0;
+    }
+    bool8 r = g_ps.autoGive(g_ps.getInv(best), Go_GetGoid(needy), Go_GetGoid(bestItem), PS_ORIGIN);
+    int got = potion_count(needy, mana, NULL);
+    if (logs < 40) {
+        const char *a = Go_GetTemplateName ? Go_GetTemplateName(best) : NULL, *b = Go_GetTemplateName ? Go_GetTemplateName(needy) : NULL;
+        const char *c = Go_GetTemplateName ? Go_GetTemplateName(bestItem) : NULL;
+        logs++;
+        logf_("potion sharing: %s (had %d) gave %s to %s -> %d, the receiver now has %d",
+              a && !IsBadStringPtrA(a, 64) ? a : "?", bestCnt, c && !IsBadStringPtrA(c, 64) ? c : "?", b && !IsBadStringPtrA(b, 64) ? b : "?", r, got);
+    }
+    return got > 0;
+}
 static void auto_potions(void *leader, DWORD now)
 {
-    static DWORD last, lifeAt[64], manaAt[64];
+    static DWORD last, lifeAt[64], manaAt[64], shareAt[64];
     static float (TC *curLife)(void *), (TC *maxLife)(void *), (TC *curMana)(void *), (TC *maxMana)(void *);
     if (!c_autoPotion || !Go_GetAspect || now - last < 300) return;
     last = now;
@@ -2994,24 +3329,32 @@ static void auto_potions(void *leader, DWORD now)
     GopColl *kids = Go_GetChildren(party);
     int n = (int)(kids->e - kids->b);
     if (n <= 1 || n > 64 || !rd(kids->b, n * sizeof(void *))) return;
+    void *members[64];
+    memcpy(members, kids->b, n * sizeof(void *));
+    if (c_potionShare) potion_link();
+    int share = c_potionShare && g_ps.ok == 1;
     float lim = c_autoPotionPct / 100.0f;
     for (int i = 0; i < n; i++) {
-        void *m = kids->b[i];
+        void *m = members[i];
         if (m == leader || !go_alive(m)) continue;
         void *mind = Go_GetMind(m);
         void *asp = Go_GetAspect(m);
         if (!rd(mind, 0x70) || !rd(asp, 0x40)) continue;
         float ml = maxLife(asp), mm = maxMana(asp);
         static int pl;
-        if (ml > 1.0f && curLife(asp) < ml * lim && now - lifeAt[i] > 2500) {
-            lifeAt[i] = now;
-            if (pl < 20) { pl++; logf_("auto potion: companion %d health %.0f of %.0f", i, curLife(asp), ml); }
-            GoMind_RSDrinkLife(mind, AO_HUMAN);
-        }
-        if (mm > 1.0f && curMana(asp) < mm * lim && now - manaAt[i] > 2500) {
-            manaAt[i] = now;
-            if (pl < 20) { pl++; logf_("auto potion: companion %d mana %.0f of %.0f", i, curMana(asp), mm); }
-            GoMind_RSDrinkMana(mind, AO_HUMAN);
+        for (int mana = 0; mana < 2; mana++) {
+            float cur = mana ? curMana(asp) : curLife(asp), max = mana ? mm : ml;
+            DWORD *at = mana ? &manaAt[i] : &lifeAt[i];
+            if (!(max > 1.0f && cur < max * lim) || now - *at <= 2500) continue;
+            if (share && potion_count(m, mana, NULL) == 0) {
+                /* nothing to drink: ask the others, and drink on the next pass if one was handed over */
+                if (now - shareAt[i] < 1500) continue;
+                shareAt[i] = now;
+                if (!potion_share(members, n, m, mana)) continue;
+            }
+            *at = now;
+            if (pl < 20) { pl++; logf_("auto potion: companion %d %s %.0f of %.0f", i, mana ? "mana" : "health", cur, max); }
+            if (mana) GoMind_RSDrinkMana(mind, AO_HUMAN); else GoMind_RSDrinkLife(mind, AO_HUMAN);
         }
     }
 }
@@ -3516,6 +3859,8 @@ static void game_update(DWORD now, DWORD btn, DWORD pressed, float lx, float ly,
     update_highlight(hero, &hp, haveDir, dx, dz, now);
     update_followers(hero, &hp, now);
     auto_potions(hero, now);
+    if (alive) auto_pickup(hero, &hp, now);
+    auto_resurrect(hero, now);
 }
 
 static void menu_update(DWORD now, float dt, DWORD btn, DWORD pressed, float rx, float ry, int entered)
@@ -3831,7 +4176,7 @@ BOOL WINAPI DllMain(HINSTANCE inst, DWORD reason, LPVOID reserved)
         char exe[MAX_PATH];
         GetModuleFileNameA(NULL, exe, MAX_PATH);
         const char *b = strrchr(exe, '\\');
-        logf_("---- DSPad build 70 loaded into %s (pid %lu)", exe, GetCurrentProcessId());
+        logf_("---- DSPad build 76 loaded into %s (pid %lu)", exe, GetCurrentProcessId());
         char mark[8];
         if (GetEnvironmentVariableA("DSPAD_ACTIVE", mark, sizeof mark)) { logf_("another DSPad copy is already active in this process; this one stays idle"); return TRUE; }
         SetEnvironmentVariableA("DSPAD_ACTIVE", "1");

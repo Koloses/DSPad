@@ -19,6 +19,9 @@ https://youtu.be/6PtO3ccN4Xw
 - **Direct 360° movement** of the controlled hero with the left stick, checked against the game's own walk mesh (lifts work, furniture and props block the way as they do for mouse movement).
 - **Party follow**: companions follow the controlled hero, join its attacks and respect their combat orders (attack freely / defend / hold).
 - **Party auto potions**: companions drink their own health or mana potions below a threshold (default 30%). The controlled hero never does.
+- **Potion sharing**: a companion with no potion left is handed one by a party member that has more than a set minimum.
+- **Auto pickup** of gold and of potions near the controlled hero, each with its own switch.
+- **Auto resurrect**: a companion carrying a resurrect scroll uses it on a dead party member once no enemy is near. The controlled hero never casts on its own.
 - **Targeting**: the nearest enemy in the stick direction is highlighted and attacked; enemies take priority over levers, chests and other interactables. Target cycling on R3.
 - **Target readout**: the name / health bar at the bottom of the screen follows the pad target instead of the mouse.
 - **Mini map** in place of the compass, with the party marker and the icons of the game's big map.
@@ -105,6 +108,9 @@ To uninstall, run `DSPad\uninstall.bat`, or delete the mod's `Mss32.dll` and ren
 | `CameraLockToLeader` | 1 | Camera stays exactly on the controlled hero |
 | `PartyFollow`, `FollowDistance` | 1, 3.5 | Companions follow, and from how far |
 | `PartyAutoPotion`, `PartyAutoPotionPercent` | 1, 30 | Companions drink potions below this percentage |
+| `PotionShare`, `PotionShareKeep` | 1, 3 | A companion with no potion left is handed one by another party member; a member only gives while it has more than `PotionShareKeep` potions of that kind |
+| `AutoPickupGold`, `AutoPickupPotions`, `AutoPickupRadius` | 1, 1, 2.5 | Gold / potions within this many metres of the controlled hero are picked up without a button press; each can be switched off on its own |
+| `AutoResurrect` | 1 | A companion carrying a resurrect scroll uses it on a dead party member once no enemy is near (the controlled hero never casts on its own) |
 | `GroundItemInfo` | 1 | Stats box for items on the ground |
 | `CompareWithEquipped` | 1 | Show the equipped item in stats boxes |
 | `TargetInfoBar` | 1 | Bottom readout follows the pad target |
